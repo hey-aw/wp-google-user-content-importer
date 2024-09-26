@@ -2,8 +2,8 @@
 /**
  * Plugin Name: Google User Content Importer (GUCI)
  * Description: Scans posts for Google User Content images, reports metadata, and allows importing.
- * Version: 2.9
- * Author: Your Name
+ * Version: 0.1
+ * Author: Matt Anthes-Washburn
  * License: GPL-2.0+
  * License URI: http://www.gnu.org/licenses/gpl-2.0.txt
  */
