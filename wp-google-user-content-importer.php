@@ -46,6 +46,7 @@ class GoogleUserContentImporter {
     private function __construct() {
         $this->check_dependencies();
         $this->init_hooks();
+        $this->register_settings();
     }
 
     /**
@@ -64,8 +65,20 @@ class GoogleUserContentImporter {
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_init', array($this, 'init_scanner'));
         add_action('admin_post_import_google_image', array($this, 'import_google_image'));
-        add_action('admin_post_import_post_google_images', array($this, 'import_post_google_images'));
+        add_action('admin_post_update_google_image', array($this, 'update_google_image'));
         add_action('admin_post_import_all_google_images', array($this, 'import_all_google_images'));
+        add_action('wp_ajax_generate_image_filename', array($this, 'ajax_generate_image_filename'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
+    }
+
+    /**
+     * Register plugin settings
+     */
+    private function register_settings() {
+        add_action('admin_init', function() {
+            register_setting('guci_settings', 'guci_openai_api_key');
+            register_setting('guci_settings', 'guci_use_ai_naming');
+        });
     }
 
     /**
@@ -95,22 +108,55 @@ class GoogleUserContentImporter {
      */
     public function init_scanner() {
         if (isset($_POST['scan_posts']) && check_admin_referer('google_user_content_scan_nonce')) {
+            // Save selected post types
+            $selected_post_types = isset($_POST['post_types']) ? array_map('sanitize_text_field', $_POST['post_types']) : array('post', 'page');
+            update_option('guci_selected_post_types', $selected_post_types);
+
+            // Start scan progress tracking
+            $scan_progress = array(
+                'total_posts' => 0,
+                'scanned_posts' => 0,
+                'found_images' => 0,
+                'current_post' => '',
+                'status' => 'starting'
+            );
+            update_option('guci_scan_progress', $scan_progress);
+
             // Check if this is the first scan
             $first_scan = get_option('guci_first_scan_completed', false);
             
             if (!$first_scan) {
+                $scan_progress['status'] = 'hashing_media';
+                update_option('guci_scan_progress', $scan_progress);
+                
                 // Hash existing media
                 $this->hash_existing_media();
                 update_option('guci_first_scan_completed', true);
             }
 
+            // Get selected post types
+            $selected_post_types = isset($_POST['post_types']) ? array_map('sanitize_text_field', $_POST['post_types']) : array('post', 'page');
+
             $posts = get_posts(array(
+                'post_type' => $selected_post_types,
                 'numberposts' => -1,
-                'post_status' => array('publish', 'draft') // Include both published and draft posts
+                'post_status' => array('publish', 'draft')
             ));
+
+            // Update total posts count
+            $scan_progress['total_posts'] = count($posts);
+            $scan_progress['status'] = 'scanning';
+            update_option('guci_scan_progress', $scan_progress);
+
             $results = array();
+            $unique_images = array();
 
             foreach ($posts as $post) {
+                // Update progress
+                $scan_progress['scanned_posts']++;
+                $scan_progress['current_post'] = get_the_title($post->ID);
+                update_option('guci_scan_progress', $scan_progress);
+
                 $images = $this->find_google_images(wp_kses_post($post->post_content));
                 if (!empty($images)) {
                     foreach ($images as &$image) {
@@ -122,13 +168,33 @@ class GoogleUserContentImporter {
                             // Check if the image already exists in the media library
                             $existing_attachment_id = $this->get_attachment_id_by_hash($image['phash']);
                             $image['existing_attachment_id'] = $existing_attachment_id;
+
+                            // De-duplication: Group images by their perceptual hash
+                            if (!isset($unique_images[$image['phash']])) {
+                                $unique_images[$image['phash']] = array(
+                                    'image' => $image,
+                                    'posts' => array()
+                                );
+                                $scan_progress['found_images']++;
+                                update_option('guci_scan_progress', $scan_progress);
+                            }
+                            $unique_images[$image['phash']]['posts'][] = array(
+                                'post_id' => $post->ID,
+                                'post_title' => get_the_title($post->ID)
+                            );
                         }
                     }
                     $results[intval($post->ID)] = $images;
                 }
             }
 
+            // Mark scan as complete
+            $scan_progress['status'] = 'complete';
+            update_option('guci_scan_progress', $scan_progress);
+
+            // Store both the full results and the de-duplicated results
             update_option('google_user_content_scan_results', $results);
+            update_option('google_user_content_unique_images', $unique_images);
             wp_redirect(admin_url('admin.php?page=google-user-content-importer&scanned=1'));
             exit;
         }
@@ -141,10 +207,19 @@ class GoogleUserContentImporter {
      * @return array Array of Google images
      */
     private function find_google_images($content) {
+        if (empty($content)) {
+            return array();
+        }
+
         $dom = new DOMDocument();
-        @$dom->loadHTML($content);
+        libxml_use_internal_errors(true);
+        @$dom->loadHTML(mb_convert_encoding($content, 'HTML-ENTITIES', 'UTF-8'));
+        libxml_clear_errors();
+
         $images = array();
-        foreach ($dom->getElementsByTagName('img') as $img) {
+        $img_tags = $dom->getElementsByTagName('img');
+
+        foreach ($img_tags as $img) {
             $src = $img->getAttribute('src');
             if (strpos($src, '.googleusercontent.com/') !== false) {
                 $images[] = array(
@@ -266,6 +341,14 @@ class GoogleUserContentImporter {
                 'height' => $attach_data['height'],
                 'filename' => basename(get_attached_file($existing_attachment_id))
             );
+        }
+
+        // Generate filename
+        if (get_option('guci_use_ai_naming') && empty($image_data['custom_filename'])) {
+            $ai_filename = $this->generate_ai_image_name($image_data['url']);
+            if ($ai_filename) {
+                $image_data['custom_filename'] = $ai_filename;
+            }
         }
 
         // Prepare filename
@@ -410,86 +493,66 @@ class GoogleUserContentImporter {
 
         check_admin_referer('import_all_google_images');
 
-        $results = get_option('google_user_content_scan_results', array());
-        $all_filenames = isset($_POST['all_filenames']) ? $_POST['all_filenames'] : array();
-
-        $total_imported = 0;
-        $total_errors = 0;
-
-        // Start output buffering
-        ob_start();
-        echo '<div class="wrap"><h2>' . esc_html__('Importing all images', 'guci') . '</h2>';
-        ob_flush();
-        flush();
-
-        $results = array(
+        $unique_images = get_option('google_user_content_unique_images', array());
+        $import_results = array(
             'imported' => array(),
             'updated' => array(),
             'errors' => array()
         );
 
-        foreach ($results as $post_id => $images) {
-            $post = get_post($post_id);
-            $content = wp_kses_post($post->post_content);
-
-            echo '<h3>' . sprintf(__('Processing Post ID: %d', 'guci'), esc_html($post_id)) . '</h3>';
-            ob_flush();
-            flush();
-
-            foreach ($images as $index => $image) {
-                $custom_filename = isset($all_filenames[$post_id][$index]) ? sanitize_file_name($all_filenames[$post_id][$index]) : 'imported_image';
-                $image['custom_filename'] = $custom_filename;
-                
-                if (isset($image['existing_attachment_id']) && $image['existing_attachment_id']) {
-                    // Update existing image
+        foreach ($unique_images as $phash => $data) {
+            $image = $data['image'];
+            if (isset($image['existing_attachment_id']) && $image['existing_attachment_id']) {
+                // Update existing image links
+                foreach ($data['posts'] as $post) {
+                    $post_content = get_post_field('post_content', $post['post_id']);
                     $existing_url = wp_get_attachment_url($image['existing_attachment_id']);
+                    
+                    // Replace old URL with new URL
                     $new_img_tag = str_replace($image['url'], $existing_url, $image['tag']);
-                    $content = str_replace($image['tag'], $new_img_tag, $content);
-                    $results['updated'][] = array(
-                        'old_url' => $image['url'],
-                        'new_url' => $existing_url
-                    );
-                } else {
-                    // Import new image
-                    $import_result = $this->import_single_image($image, $post_id);
-                    if (!is_wp_error($import_result)) {
-                        $new_img_tag = str_replace($image['url'], $import_result['new_url'], $image['tag']);
-                        $new_img_tag = str_replace(
-                            'src="' . esc_url($image['url']) . '"',
-                            'src="' . esc_url($import_result['new_url']) . '" width="' . esc_attr($import_result['width']) . '" height="' . esc_attr($import_result['height']) . '"',
-                            $new_img_tag
-                        );
-                        $content = str_replace($image['tag'], $new_img_tag, $content);
-                        $results['imported'][] = array(
-                            'old_url' => $image['url'],
-                            'new_url' => $import_result['new_url'],
-                            'filename' => $import_result['filename']
-                        );
-                        $total_imported++;
-                        echo '<p>' . sprintf(__('Imported: %s as %s', 'guci'), esc_html($custom_filename ?: $image['filename']), esc_html($import_result['filename'])) . '</p>';
-                    } else {
-                        $total_errors++;
-                        echo '<p>' . sprintf(__('Error importing: %s', 'guci'), esc_html($custom_filename ?: $image['filename'])) . '</p>';
-                        $results['errors'][] = array(
-                            'url' => $image['url'],
-                            'error' => $import_result->get_error_message()
-                        );
-                    }
+                    $post_content = str_replace($image['tag'], $new_img_tag, $post_content);
+                    
+                    // Update post
+                    wp_update_post(array(
+                        'ID' => $post['post_id'],
+                        'post_content' => $post_content
+                    ));
                 }
-                ob_flush();
-                flush();
+                
+                $import_results['updated'][] = array(
+                    'old_url' => $image['url'],
+                    'new_url' => $existing_url
+                );
+            } else {
+                // Import new image
+                $import_result = $this->import_single_image($image, $data['posts'][0]['post_id']);
+                if (!is_wp_error($import_result)) {
+                    $import_results['imported'][] = $import_result;
+                    
+                    // Update image in all posts where it appears
+                    foreach ($data['posts'] as $post) {
+                        $post_content = get_post_field('post_content', $post['post_id']);
+                        $new_img_tag = str_replace($image['url'], $import_result['new_url'], $image['tag']);
+                        $post_content = str_replace($image['tag'], $new_img_tag, $post_content);
+                        wp_update_post(array(
+                            'ID' => $post['post_id'],
+                            'post_content' => $post_content
+                        ));
+                    }
+                } else {
+                    $import_results['errors'][] = array(
+                        'url' => $image['url'],
+                        'error' => $import_result->get_error_message()
+                    );
+                }
             }
-
-            wp_update_post(array(
-                'ID' => $post_id,
-                'post_content' => $content
-            ));
         }
 
-        echo '<p>' . sprintf(__('Import completed. Successfully imported: %d images. Errors: %d', 'guci'), $total_imported, $total_errors) . '</p>';
-        echo '<a href="' . esc_url(admin_url('admin.php?page=google-user-content-importer')) . '" class="button">' . esc_html__('Back to Importer', 'guci') . '</a>';
-        echo '</div>';
-        ob_end_flush();
+        // Store the import results in a transient
+        set_transient('guci_import_results_all', $import_results, 60 * 5); // Store for 5 minutes
+
+        // Redirect back to the main page with a query parameter
+        wp_redirect(add_query_arg(array('page' => 'google-user-content-importer', 'imported' => 'all'), admin_url('admin.php')));
         exit;
     }
 
@@ -510,7 +573,7 @@ class GoogleUserContentImporter {
         if ($imported && strpos($imported, 'post_') === 0) {
             $post_id = intval(substr($imported, 5));
             $import_results = get_transient('guci_import_results_' . $post_id);
-            delete_transient('guci_import_results_' . $post_id); // Clean up after displaying
+            delete_transient('guci_import_results_' . $post_id);
         } elseif ($imported && strpos($imported, 'single_') === 0) {
             $post_id = intval(substr($imported, 7));
             $import_results = get_transient('guci_import_results_single_' . $post_id);
@@ -524,100 +587,284 @@ class GoogleUserContentImporter {
             delete_transient('guci_update_results_single_' . $post_id);
         }
 
+        // Add check for 'all' import results
+        if ($imported === 'all') {
+            $import_results = get_transient('guci_import_results_all');
+            delete_transient('guci_import_results_all');
+        }
+
+        // Add this before the scan form
+        $scan_progress = get_option('guci_scan_progress', array());
+        if (!empty($scan_progress) && $scan_progress['status'] !== 'complete') {
+            ?>
+            <div class="scan-progress-wrapper">
+                <h2><?php esc_html_e('Scan Progress', 'guci'); ?></h2>
+                <div class="scan-progress">
+                    <?php if ($scan_progress['status'] === 'hashing_media'): ?>
+                        <p><?php esc_html_e('Hashing existing media library...', 'guci'); ?></p>
+                    <?php else: ?>
+                        <p>
+                            <?php 
+                            printf(
+                                esc_html__('Scanning posts: %1$d of %2$d (%3$d%%) - Found %4$d images', 'guci'),
+                                $scan_progress['scanned_posts'],
+                                $scan_progress['total_posts'],
+                                $scan_progress['total_posts'] ? ($scan_progress['scanned_posts'] / $scan_progress['total_posts'] * 100) : 0,
+                                $scan_progress['found_images']
+                            );
+                            ?>
+                        </p>
+                        <?php if (!empty($scan_progress['current_post'])): ?>
+                            <p><?php printf(esc_html__('Currently scanning: %s', 'guci'), esc_html($scan_progress['current_post'])); ?></p>
+                        <?php endif; ?>
+                    <?php endif; ?>
+                    <div class="progress-bar">
+                        <div class="progress" style="width: <?php echo esc_attr($scan_progress['total_posts'] ? ($scan_progress['scanned_posts'] / $scan_progress['total_posts'] * 100) : 0); ?>%"></div>
+                    </div>
+                </div>
+            </div>
+            <style>
+                .progress-bar {
+                    width: 100%;
+                    height: 20px;
+                    background: #f0f0f0;
+                    border-radius: 10px;
+                    overflow: hidden;
+                    margin: 10px 0;
+                }
+                .progress-bar .progress {
+                    height: 100%;
+                    background: #2271b1;
+                    transition: width 0.3s ease;
+                }
+                .scan-progress-wrapper {
+                    background: #fff;
+                    padding: 15px;
+                    margin: 20px 0;
+                    border: 1px solid #ccd0d4;
+                    box-shadow: 0 1px 1px rgba(0,0,0,.04);
+                }
+            </style>
+            <?php
+        }
+
+        // Add this to the display_results_page() method, before the HTML output
+        ?>
+        <style>
+            .ai-filename-cell code {
+                background: #f0f0f0;
+                padding: 2px 6px;
+                border-radius: 3px;
+            }
+            .ai-filename-cell .error {
+                color: #dc3232;
+            }
+            .ai-filename-cell .generating {
+                color: #666;
+            }
+        </style>
+        <?php
+
         ?>
         <div class="wrap">
             <h1><?php esc_html_e('Google User Content Importer (GUCI)', 'guci'); ?></h1>
+
+            <!-- Settings Section -->
+            <div class="card">
+                <h2><?php esc_html_e('Settings', 'guci'); ?></h2>
+                <form method="post" action="options.php">
+                    <?php settings_fields('guci_settings'); ?>
+                    <table class="form-table">
+                        <tr>
+                            <th scope="row"><?php esc_html_e('OpenAI API Key', 'guci'); ?></th>
+                            <td>
+                                <input type="password" 
+                                       name="guci_openai_api_key" 
+                                       value="<?php echo esc_attr(get_option('guci_openai_api_key')); ?>" 
+                                       class="regular-text">
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row"><?php esc_html_e('Use AI for Image Naming', 'guci'); ?></th>
+                            <td>
+                                <input type="checkbox" 
+                                       name="guci_use_ai_naming" 
+                                       value="1" 
+                                       <?php checked(get_option('guci_use_ai_naming'), '1'); ?>>
+                                <span class="description">
+                                    <?php esc_html_e('Use OpenAI to generate descriptive image names', 'guci'); ?>
+                                </span>
+                            </td>
+                        </tr>
+                    </table>
+                    <?php submit_button(__('Save Settings', 'guci')); ?>
+                </form>
+            </div>
+
+            <hr class="wp-header-end">
             
             <?php if ($import_results): ?>
-                <div class="notice notice-success">
-                    <p><?php esc_html_e('Import process completed.', 'guci'); ?></p>
+                <div class="notice notice-success is-dismissible">
+                    <?php if ($imported === 'all'): ?>
+                        <p>
+                            <?php 
+                            $imported_count = count($import_results['imported']);
+                            $updated_count = count($import_results['updated']);
+                            $error_count = count($import_results['errors']);
+                            
+                            if ($imported_count > 0 || $updated_count > 0) {
+                                printf(
+                                    esc_html__('Successfully processed images: %1$d imported, %2$d updated.', 'guci'),
+                                    $imported_count,
+                                    $updated_count
+                                );
+                                if ($error_count > 0) {
+                                    echo ' ';
+                                    printf(
+                                        esc_html__('%d errors occurred.', 'guci'),
+                                        $error_count
+                                    );
+                                }
+                            } else {
+                                esc_html_e('No images were processed.', 'guci');
+                            }
+                            ?>
+                        </p>
+                    <?php else: ?>
+                        <p><?php esc_html_e('Import process completed.', 'guci'); ?></p>
+                    <?php endif; ?>
                 </div>
                 <?php $this->display_import_results($import_results, $post_id); ?>
             <?php endif; ?>
 
             <?php if ($update_results): ?>
-                <div class="notice notice-success">
-                    <p><?php esc_html_e('Update process completed.', 'guci'); ?></p>
+                <div class="notice notice-success is-dismissible">
+                    <p><?php esc_html_e('Update process completed successfully.', 'guci'); ?></p>
                 </div>
                 <?php $this->display_update_results($update_results, $post_id); ?>
             <?php endif; ?>
 
-            <form method="post" action="">
-                <?php wp_nonce_field('google_user_content_scan_nonce'); ?>
-                <input type="submit" name="scan_posts" class="button button-primary" value="<?php esc_attr_e('Scan Posts', 'guci'); ?>">
-            </form>
+            <!-- Scan Form -->
+            <div class="card">
+                <form method="post" action="">
+                    <?php wp_nonce_field('google_user_content_scan_nonce'); ?>
+                    <h2><?php esc_html_e('Select Post Types to Scan', 'guci'); ?></h2>
+                    <?php
+                    $post_types = get_post_types(array('public' => true), 'objects');
+                    $selected_post_types = get_option('guci_selected_post_types', array('post', 'page'));
+                    foreach ($post_types as $post_type) {
+                        ?>
+                        <label>
+                            <input type="checkbox" name="post_types[]" value="<?php echo esc_attr($post_type->name); ?>" 
+                                <?php checked(in_array($post_type->name, $selected_post_types)); ?>>
+                            <?php echo esc_html($post_type->label); ?>
+                        </label><br>
+                        <?php
+                    }
+                    ?>
+                    <br>
+                    <input type="submit" name="scan_posts" class="button button-primary" value="<?php esc_attr_e('Scan Posts', 'guci'); ?>">
+                </form>
+            </div>
 
             <?php if (isset($_GET['scanned'])): ?>
-                <?php if (!empty($results)): ?>
-                    <h2><?php esc_html_e('Scan Results', 'guci'); ?></h2>
-                    <?php foreach ($results as $post_id => $images): ?>
-                        <h3><?php echo esc_html(sprintf(__('Post ID: %d - %s', 'guci'), $post_id, get_the_title($post_id))); ?></h3>
-                        <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                            <input type="hidden" name="action" value="import_post_google_images">
-                            <input type="hidden" name="post_id" value="<?php echo esc_attr($post_id); ?>">
-                            <?php wp_nonce_field('import_post_google_images'); ?>
-                            <input type="submit" class="button button-secondary" value="<?php esc_attr_e('Import/Update All Images for this Post', 'guci'); ?>">
-                        </form>
-                        <table class="widefat">
-                            <thead>
+                <?php 
+                $unique_images = get_option('google_user_content_unique_images', array());
+                if (!empty($unique_images)): 
+                ?>
+                    <h2><?php esc_html_e('Scan Results (De-duplicated)', 'guci'); ?></h2>
+                    <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                        <input type="hidden" name="action" value="import_all_google_images">
+                        <?php wp_nonce_field('import_all_google_images'); ?>
+                        <input type="submit" class="button button-primary" value="<?php esc_attr_e('Import and Update All Images', 'guci'); ?>">
+                    </form>
+                    <table class="widefat">
+                        <thead>
+                            <tr>
+                                <th><?php esc_html_e('Image Preview', 'guci'); ?></th>
+                                <th><?php esc_html_e('Image URL', 'guci'); ?></th>
+                                <th><?php esc_html_e('Alt Text', 'guci'); ?></th>
+                                <th><?php esc_html_e('AI Suggested Name', 'guci'); ?></th>
+                                <th><?php esc_html_e('Posts', 'guci'); ?></th>
+                                <th><?php esc_html_e('Status', 'guci'); ?></th>
+                                <th><?php esc_html_e('Action', 'guci'); ?></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($unique_images as $phash => $data): ?>
+                                <?php 
+                                $image = $data['image']; 
+                                $suggested_filename = $this->get_ai_filename_suggestion($image['url']);
+                                ?>
                                 <tr>
-                                    <th><?php esc_html_e('Image Preview', 'guci'); ?></th>
-                                    <th><?php esc_html_e('Image URL', 'guci'); ?></th>
-                                    <th><?php esc_html_e('Alt Text', 'guci'); ?></th>
-                                    <th><?php esc_html_e('Perceptual Hash', 'guci'); ?></th>
-                                    <th><?php esc_html_e('Status', 'guci'); ?></th>
-                                    <th><?php esc_html_e('Action', 'guci'); ?></th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                <?php foreach ($images as $index => $image): ?>
-                                    <tr>
-                                        <td><img src="<?php echo esc_url($image['url']); ?>" style="max-width: 100px; max-height: 100px;" alt="<?php echo esc_attr($image['alt_text']); ?>"></td>
-                                        <td title="<?php echo esc_attr($image['url']); ?>"><?php echo esc_html($this->truncate_url($image['url'])); ?></td>
-                                        <td><?php echo esc_html($image['alt_text']); ?></td>
-                                        <td><?php echo esc_html($image['phash'] ?? 'N/A'); ?></td>
-                                        <td>
-                                            <?php
-                                            if (isset($image['existing_attachment_id']) && $image['existing_attachment_id']) {
-                                                echo esc_html__('Already in Media Library', 'guci');
+                                    <td><img src="<?php echo esc_url($image['url']); ?>" style="max-width: 100px; max-height: 100px;" alt="<?php echo esc_attr($image['alt_text']); ?>"></td>
+                                    <td title="<?php echo esc_attr($image['url']); ?>"><?php echo esc_html($this->truncate_url($image['url'])); ?></td>
+                                    <td><?php echo esc_html($image['alt_text']); ?></td>
+                                    <td class="ai-filename-cell" data-image-url="<?php echo esc_attr($image['url']); ?>">
+                                        <?php 
+                                        if (!empty($suggested_filename)) {
+                                            echo '<code>' . esc_html($suggested_filename) . '</code>';
+                                        } else {
+                                            if (get_option('guci_use_ai_naming')) {
+                                                echo '<em class="generating">' . esc_html__('Generating...', 'guci') . '</em>';
                                             } else {
-                                                echo esc_html__('New Image', 'guci');
+                                                echo '<em>' . esc_html__('AI naming disabled', 'guci') . '</em>';
                                             }
-                                            ?>
-                                        </td>
-                                        <td>
-                                            <?php if (!isset($image['existing_attachment_id']) || !$image['existing_attachment_id']): ?>
-                                                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                                                    <input type="hidden" name="action" value="import_google_image">
-                                                    <input type="hidden" name="image_url" value="<?php echo esc_url($image['url']); ?>">
-                                                    <input type="hidden" name="post_id" value="<?php echo esc_attr($post_id); ?>">
-                                                    
-                                                    <?php
-                                                        $default_filename = !empty($image['alt_text']) ? sanitize_file_name($image['alt_text']) : 'imported_image';
-                                                    ?>
-                                                    <input type="text" name="custom_filename" value="<?php echo esc_attr($default_filename); ?>" placeholder="<?php esc_attr_e('Enter filename', 'guci'); ?>">
-                                                    
-                                                    <?php wp_nonce_field('import_google_image'); ?>
-                                                    <input type="submit" class="button button-secondary" value="<?php esc_attr_e('Import Image', 'guci'); ?>">
-                                                </form>
-                                            <?php else: ?>
-                                                <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
-                                                    <input type="hidden" name="action" value="update_google_image">
-                                                    <input type="hidden" name="image_url" value="<?php echo esc_url($image['url']); ?>">
-                                                    <input type="hidden" name="post_id" value="<?php echo esc_attr($post_id); ?>">
-                                                    <input type="hidden" name="attachment_id" value="<?php echo esc_attr($image['existing_attachment_id']); ?>">
-                                                    <?php wp_nonce_field('update_google_image'); ?>
-                                                    <input type="submit" class="button button-secondary" value="<?php esc_attr_e('Update Link', 'guci'); ?>">
-                                                </form>
-                                            <?php endif; ?>
-                                        </td>
-                                    </tr>
-                                <?php endforeach; ?>
-                            </tbody>
-                        </table>
-                    <?php endforeach; ?>
+                                        }
+                                        ?>
+                                    </td>
+                                    <td>
+                                        <?php foreach ($data['posts'] as $post): ?>
+                                            <a href="<?php echo get_edit_post_link($post['post_id']); ?>"><?php echo esc_html($post['post_title']); ?></a><br>
+                                        <?php endforeach; ?>
+                                    </td>
+                                    <td>
+                                        <?php
+                                        if (isset($image['existing_attachment_id']) && $image['existing_attachment_id']) {
+                                            echo esc_html__('Already in Media Library', 'guci');
+                                        } else {
+                                            echo esc_html__('New Image', 'guci');
+                                        }
+                                        ?>
+                                    </td>
+                                    <td>
+                                        <?php if (!isset($image['existing_attachment_id']) || !$image['existing_attachment_id']): ?>
+                                            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                                                <input type="hidden" name="action" value="import_google_image">
+                                                <input type="hidden" name="image_url" value="<?php echo esc_url($image['url']); ?>">
+                                                <input type="hidden" name="post_id" value="<?php echo esc_attr($data['posts'][0]['post_id']); ?>">
+                                                
+                                                <?php
+                                                    $default_filename = !empty($suggested_filename) ? 
+                                                        $suggested_filename : 
+                                                        (!empty($image['alt_text']) ? sanitize_file_name($image['alt_text']) : 'imported_image');
+                                                ?>
+                                                <input type="text" 
+                                                       name="custom_filename" 
+                                                       value="<?php echo esc_attr($default_filename); ?>" 
+                                                       placeholder="<?php esc_attr_e('Enter filename', 'guci'); ?>"
+                                                       class="regular-text">
+                                                
+                                                <?php wp_nonce_field('import_google_image'); ?>
+                                                <input type="submit" class="button button-secondary" value="<?php esc_attr_e('Import Image', 'guci'); ?>">
+                                            </form>
+                                        <?php else: ?>
+                                            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                                                <input type="hidden" name="action" value="update_google_image">
+                                                <input type="hidden" name="image_url" value="<?php echo esc_url($image['url']); ?>">
+                                                <input type="hidden" name="post_id" value="<?php echo esc_attr($data['posts'][0]['post_id']); ?>">
+                                                <input type="hidden" name="attachment_id" value="<?php echo esc_attr($image['existing_attachment_id']); ?>">
+                                                <?php wp_nonce_field('update_google_image'); ?>
+                                                <input type="submit" class="button button-secondary" value="<?php esc_attr_e('Update Link', 'guci'); ?>">
+                                            </form>
+                                        <?php endif; ?>
+                                    </td>
+                                </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
                 <?php else: ?>
-                    <p><?php esc_html_e('No Google User Content images found in any posts.', 'guci'); ?></p>
+                    <p><?php esc_html_e('No Google User Content images found in the selected post types.', 'guci'); ?></p>
                 <?php endif; ?>
             <?php endif; ?>
         </div>
@@ -852,7 +1099,201 @@ class GoogleUserContentImporter {
         wp_redirect(add_query_arg(array('page' => 'google-user-content-importer', 'updated' => 'single_' . $post_id), admin_url('admin.php')));
         exit;
     }
+
+    /**
+     * Generate image name using OpenAI
+     */
+    private function generate_ai_image_name($image_url) {
+        $api_key = get_option('guci_openai_api_key');
+        if (empty($api_key)) {
+            error_log('GUCI: OpenAI API key is not set');
+            return false;
+        }
+
+        // Validate image URL
+        if (!filter_var($image_url, FILTER_VALIDATE_URL)) {
+            error_log('GUCI: Invalid image URL format: ' . $image_url);
+            return false;
+        }
+
+        $request_body = array(
+            'model' => 'gpt-4o-mini',  // Changed from gpt-4-vision-preview to gpt-4o-mini
+            'messages' => array(
+                array(
+                    'role' => 'user',
+                    'content' => array(
+                        array(
+                            'type' => 'text',
+                            'text' => 'Generate a short, SEO-friendly filename (without extension) for this image. Use only lowercase letters, numbers, and hyphens. Keep it under 50 characters. Respond with only the filename.'
+                        ),
+                        array(
+                            'type' => 'image_url',
+                            'image_url' => array(
+                                'url' => $image_url
+                            )
+                        )
+                    )
+                )
+            ),
+            'max_tokens' => 50
+        );
+
+        error_log('GUCI: Sending request to OpenAI API for URL: ' . $image_url);
+
+        $response = wp_remote_post('https://api.openai.com/v1/chat/completions', array(
+            'headers' => array(
+                'Authorization' => 'Bearer ' . $api_key,
+                'Content-Type' => 'application/json',
+            ),
+            'body' => json_encode($request_body),
+            'timeout' => 30,
+            'data_format' => 'body'
+        ));
+
+        if (is_wp_error($response)) {
+            $error_message = $response->get_error_message();
+            error_log('GUCI OpenAI Error: ' . $error_message);
+            throw new Exception('API request failed: ' . $error_message);
+        }
+
+        $response_code = wp_remote_retrieve_response_code($response);
+        $response_body = wp_remote_retrieve_body($response);
+        
+        error_log('GUCI OpenAI Response Code: ' . $response_code);
+        error_log('GUCI OpenAI Response Body: ' . $response_body);
+
+        if ($response_code !== 200) {
+            throw new Exception('API returned non-200 status code: ' . $response_code . ' - ' . $response_body);
+        }
+
+        $body = json_decode($response_body, true);
+        
+        if (json_last_error() !== JSON_ERROR_NONE) {
+            throw new Exception('Failed to parse JSON response: ' . json_last_error_msg());
+        }
+
+        if (empty($body['choices'][0]['message']['content'])) {
+            throw new Exception('Invalid response structure from API');
+        }
+
+        $filename = strtolower(trim($body['choices'][0]['message']['content']));
+        $filename = preg_replace('/[^a-z0-9-]/', '-', $filename);
+        $filename = preg_replace('/-+/', '-', $filename);
+        $filename = trim($filename, '-');
+
+        if (empty($filename)) {
+            throw new Exception('Generated filename is empty after cleanup');
+        }
+
+        return $filename;
+    }
+
+    /**
+     * Handle AJAX request for filename generation
+     */
+    public function ajax_generate_image_filename() {
+        try {
+            if (!current_user_can('upload_files')) {
+                throw new Exception('Permission denied');
+            }
+
+            $image_url = isset($_POST['image_url']) ? esc_url_raw($_POST['image_url']) : '';
+            if (empty($image_url)) {
+                throw new Exception('Invalid image URL');
+            }
+
+            if (empty(get_option('guci_openai_api_key'))) {
+                throw new Exception('OpenAI API key is not configured');
+            }
+
+            $suggested_filename = $this->generate_ai_image_name($image_url);
+            if ($suggested_filename) {
+                wp_send_json_success(array('filename' => $suggested_filename));
+            } else {
+                throw new Exception('Failed to generate filename');
+            }
+        } catch (Exception $e) {
+            error_log('GUCI Error in ajax_generate_image_filename: ' . $e->getMessage());
+            wp_send_json_error(array(
+                'message' => 'Generation failed',
+                'details' => $e->getMessage(),
+                'code' => 'generation_failed'
+            ));
+        }
+    }
+
+    /**
+     * Get cached AI filename suggestion
+     * 
+     * @param string $image_url The image URL
+     * @return string|null Cached filename or null if not cached
+     */
+    private function get_cached_ai_filename($image_url) {
+        $cached_filenames = get_option('guci_ai_filename_cache', array());
+        return isset($cached_filenames[$image_url]) ? $cached_filenames[$image_url] : null;
+    }
+
+    /**
+     * Cache AI filename suggestion
+     * 
+     * @param string $image_url The image URL
+     * @param string $filename The suggested filename
+     */
+    private function cache_ai_filename($image_url, $filename) {
+        $cached_filenames = get_option('guci_ai_filename_cache', array());
+        $cached_filenames[$image_url] = $filename;
+        update_option('guci_ai_filename_cache', $cached_filenames);
+    }
+
+    /**
+     * Get AI filename suggestion with caching
+     * 
+     * @param string $image_url The image URL
+     * @return string The suggested filename
+     */
+    private function get_ai_filename_suggestion($image_url) {
+        // Check cache first
+        $cached_filename = $this->get_cached_ai_filename($image_url);
+        if ($cached_filename !== null) {
+            return $cached_filename;
+        }
+
+        // Generate new suggestion if AI naming is enabled
+        if (get_option('guci_use_ai_naming')) {
+            error_log('GUCI: AI naming is enabled, generating filename for ' . $image_url);
+            $ai_filename = $this->generate_ai_image_name($image_url);
+            if ($ai_filename) {
+                $this->cache_ai_filename($image_url, $ai_filename);
+                return $ai_filename;
+            }
+            error_log('GUCI: Failed to generate AI filename');
+        } else {
+            error_log('GUCI: AI naming is disabled');
+        }
+
+        return '';
+    }
+
+    /**
+     * Enqueue admin scripts
+     *
+     * @param string $hook The current admin page
+     */
+    public function enqueue_admin_scripts($hook) {
+        if ('toplevel_page_google-user-content-importer' !== $hook) {
+            return;
+        }
+        
+        wp_enqueue_script(
+            'guci-admin',
+            plugins_url('js/admin.js', __FILE__),
+            array('jquery'),
+            '1.0.0',
+            true
+        );
+    }
 }
 
 // Initialize the plugin
 GoogleUserContentImporter::get_instance();
+
